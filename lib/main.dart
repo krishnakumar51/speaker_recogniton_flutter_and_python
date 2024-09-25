@@ -38,7 +38,7 @@ class _SpeakerRecognitionDemoState extends State<SpeakerRecognitionDemo> {
   late Directory directory;
   String filePath = "";
   int sampleCount = 0; // Tracks the number of uploaded samples
-  final int maxSamples = 00; // Limit to 10 samples
+  final int maxSamples = 10; // Limit to 10 samples
   bool isModelTrained = false; // Indicates if the model has been trained
   String modelStatus = '';
 
