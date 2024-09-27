@@ -1,4 +1,3 @@
-from flask import Flask, request, jsonify
 import os
 import uuid
 import torch
@@ -6,7 +5,11 @@ import traceback
 import noisereduce as nr
 import librosa
 import soundfile as sf
+import speech_recognition as sr
+from flask import Flask, request, jsonify
 from flask_cors import CORS
+from gtts import gTTS
+from IPython.display import Audio, display
 from imp import VariableLengthSpeakerVerificationModel, train_model, verify_speaker, get_embedding, MODEL_PATH, SCALER_PATH
 
 app = Flask(__name__)
@@ -26,17 +29,45 @@ scaler = None
 # Function to denoise audio
 def denoise_audio(file_path):
     try:
-        # Load audio
         audio_data, sample_rate = librosa.load(file_path, sr=None)
-        # Apply noise reduction
         denoised_audio = nr.reduce_noise(y=audio_data, sr=sample_rate)
-        # Save denoised audio back to file
         sf.write(file_path, denoised_audio, sample_rate)
         print(f"Audio at {file_path} denoised successfully.")
     except Exception as e:
         print(f"Error during denoising: {str(e)}")
 
+def detect_wake_word(audio_file_path):
+    recognizer = sr.Recognizer()
 
+    # Load the audio file and apply the recognizer
+    with sr.AudioFile(audio_file_path) as source:
+        audio = recognizer.record(source)
+        try:
+            # Transcribe the audio to text
+            text = recognizer.recognize_google(audio)
+            print(f"Recognized Text: {text}")
+
+            # Check if the recognized text contains "hi siri"
+            if text.lower() == "hi siri":
+                return True
+            else:
+                print("Wake word not detected.")
+                return False
+        except sr.UnknownValueError:
+            # Handle cases where the speech is unclear or not understandable
+            print("Could not understand the audio")
+            return False
+        except sr.RequestError as e:
+            # Handle any issues with the speech recognition service
+            print(f"Speech recognition error: {e}")
+            return "Wake word not detected."
+
+
+# Function to generate and play TTS response (for feedback in Colab)
+def generate_tts_response(text, output_file):
+    tts = gTTS(text=text)
+    tts.save(output_file)
+    display(Audio(output_file, autoplay=True))
 
 # Function to load the model and scaler once at server startup
 def load_model():
@@ -61,7 +92,6 @@ def load_model():
 def ping():
     return jsonify({'message': 'pong'}), 200
 
-# New route to check model status
 @app.route('/model_status', methods=['GET'])
 def model_status():
     if model is not None and scaler is not None:
@@ -69,6 +99,7 @@ def model_status():
     else:
         return jsonify({'message': 'No trained model found. Please train the model first.'}), 404
 
+# Modify the /upload_sample route to check for wake word detection before accepting the sample
 @app.route('/upload_sample', methods=['POST'])
 def upload_sample():
     if 'audio' not in request.files:
@@ -79,14 +110,26 @@ def upload_sample():
         return jsonify({'error': 'No selected file'}), 400
 
     unique_filename = str(uuid.uuid4()) + '.wav'
-    audio_path = os.path.join(AUTHORIZED_USER_FOLDER, unique_filename)
+    audio_path = os.path.join(TEMP_AUDIO_FOLDER, unique_filename)
     audio_file.save(audio_path)
     print(f"Audio sample saved at {audio_path}")
 
-    # Apply denoiser to the uploaded audio
-    denoise_audio(audio_path)
+    # Check for the wake word before proceeding
+    if not detect_wake_word(audio_path):
+        os.remove(audio_path)  # Delete the sample if wake word is not detected
+        generate_tts_response("Wake word not detected, please try again.", "retry.mp3")
+        return jsonify({'message': 'Wake word not detected, please upload the sample again'}), 400
 
-    return jsonify({'message': 'Audio sample uploaded and denoised successfully'}), 200
+    # Move the valid sample to the authenticated_user folder
+    final_audio_path = os.path.join(AUTHORIZED_USER_FOLDER, unique_filename)
+    os.rename(audio_path, final_audio_path)
+    print(f"Audio sample moved to {final_audio_path}")
+
+    # Apply denoiser to the uploaded audio
+    denoise_audio(final_audio_path)
+
+    return jsonify({'message': 'Audio sample uploaded and wake word detected'}), 200
+
 
 @app.route('/train_model', methods=['GET', 'POST'])
 def train_model_endpoint():
@@ -106,26 +149,37 @@ def train_model_endpoint():
         print(f"Error during training: {e}")
         return jsonify({'error': f'Error during training: {str(e)}'}), 500
 
+
+
 @app.route('/recognize', methods=['POST'])
 def recognize_speaker_endpoint():
     if 'audio' not in request.files:
-        return jsonify({'error': 'No audio file provided'}), 400
+        return jsonify({'error': 'No audio file provided'}), 400  # Only return 400 for no file
 
     audio_file = request.files['audio']
     if audio_file.filename == '':
-        return jsonify({'error': 'No selected file'}), 400
+        return jsonify({'error': 'No selected file'}), 400  # Only return 400 for empty file
 
+    # Save the uploaded audio file
     unique_filename = str(uuid.uuid4()) + '.wav'
     temp_path = os.path.join(TEMP_AUDIO_FOLDER, unique_filename)
     audio_file.save(temp_path)
     print(f"Audio file saved at {temp_path}")
 
-    # Apply denoiser to the temporary audio file
+    # Apply denoising (optional) if wake word was detected
     denoise_audio(temp_path)
 
+
+    # Check for the wake word first
+    if not detect_wake_word(temp_path):
+        # Case 1: Wake word not detected
+        os.remove(temp_path)  # Clean up temp file
+        return jsonify({'message': 'Wake word not detected.'}), 200  # Always return 200 for a valid request, even if the wake word is not found
+
+    
     if model is None or scaler is None:  # Check if the model is loaded
         print("Model or scaler is not loaded, cannot proceed with recognition.")
-        return jsonify({'error': 'Model not loaded. Please train the model first.'}), 400
+        return jsonify({'error': 'Model not loaded. Please train the model first.'}), 500  # Use 500 if internal model issue
 
     try:
         print(f"Processing audio file for recognition: {temp_path}")
@@ -136,13 +190,18 @@ def recognize_speaker_endpoint():
         print(f"Temporary file {temp_path} deleted.")
 
         if is_authorized:
+            # Case 3: Speaker verified as authorized
             return jsonify({'message': 'Speaker identified as authorized', 'probability': probability}), 200
         else:
-            return jsonify({'message': 'Speaker identified as unauthorized', 'probability': probability}), 200
+            # Case 2: Wake word detected but speaker not identified
+            return jsonify({'message': 'Wake word detected but speaker unidentified', 'probability': probability}), 200
     except Exception as e:
-        print(f"Error during recognition: {str(e)}")  # Enhanced logging for the error
-        traceback.print_exc()  # Print the full stack trace
+        print(f"Error during recognition: {str(e)}")
+        traceback.print_exc()
         return jsonify({'error': f'Error during recognition: {str(e)}'}), 500
+
+
+
 
 # Load model once at startup
 load_model()
